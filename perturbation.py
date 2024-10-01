@@ -3,108 +3,161 @@ import torchvision
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.models import resnet50
 
-# Import the custom model
-from Perturbation.model.mobilenetv2 import cifar100_mobilenetv2_x1_4
-from Perturbation.model.repvgg import cifar100_repvgg_a2
-from Perturbation.model.resnet import cifar100_resnet32, cifar100_resnet44
-from Perturbation.model.shufflenetv2 import cifar100_shufflenetv2_x2_0
-from Perturbation.model.vgg import cifar100_vgg13_bn
+# Import custom models
+from model.resnet import cifar100_resnet56, cifar10_resnet56
 
+
+# Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+"""
+Model Reference: https://github.com/chenyaofo/pytorch-cifar-models
+"""
 
-# vgg13_bn
-# load_model = cifar100_vgg13_bn(pretrained=True)
-# load_model_name = 'cifar100_vgg13_bn'
+# Select and load the pre-trained model
 
-# resnet44
-# load_model = cifar100_resnet44(pretrained=True)
-# load_model_name = 'cifar100_resnet44'
+# ResNet56 for cifar100
+load_model = cifar100_resnet56(pretrained=True)
+load_model_name = 'resnet56_cifar100'
 
-# mobilenetv2_x1_4
-# load_model = cifar100_mobilenetv2_x1_4(pretrained = True)
-# load_model_name = 'cifar100_mobilenetv2_x1_4'
+# ResNet56 for cifar10
+# load_model = cifar10_resnet56(pretrained=True)
+# load_model_name = 'resnet56_cifar10'
 
-# shufflenetv2_x2_0
-# load_model = cifar100_shufflenetv2_x2_0(pretrained=True)
-# load_model_name = 'cifar100_shufflenetv2_x2_0'
-
-# repvgg_a2
-load_model = cifar100_repvgg_a2(pretrained=True)
-load_model_name = 'cifar100_repvgg_a2'
 
 load_model = load_model.to(device)
 
+# Freeze all model parameters to prevent training
+for param in load_model.parameters():
+    param.requires_grad = False
 
-# Function to check the accuracy of a pretrained model
 def check_accuracy(model, dataloader, device):
-    length = len(dataloader.dataset)
-    total_accuracy = 0
+    """
+    Evaluate the accuracy of the model on a given dataset.
+
+    Args:
+        model (nn.Module): The model to evaluate.
+        dataloader (DataLoader): DataLoader for the dataset.
+        device (torch.device): The device to perform computation on.
+
+    Returns:
+        float: The accuracy of the model on the dataset.
+    """
+    total_samples = len(dataloader.dataset)
+    total_correct = 0
 
     model.eval()
     with torch.no_grad():
-        for data in dataloader:
-            imgs, targets = data
+        for imgs, targets in dataloader:
             imgs, targets = imgs.to(device), targets.to(device)
             outputs = model(imgs)
-            accuracy = (outputs.argmax(1) == targets).sum().item()
-            total_accuracy += accuracy
+            predictions = outputs.argmax(dim=1)
+            total_correct += (predictions == targets).sum().item()
 
-    accuracy = total_accuracy / length
-    print(f"Accuracy : {accuracy:.4f}")
+    accuracy = total_correct / total_samples
+    print(f"Accuracy: {accuracy:.4f}")
     return accuracy
 
-# Define the modified pretrained model which introduces a perturbation layer
-class ModifiedModel(nn.Module):
+
+class PerturbModel(nn.Module):
+    """
+    A modified model that adds Gaussian noise to the logits to perturb model performance.
+
+    Args:
+        model (nn.Module): The original pre-trained model.
+        pert_ratio (float): The perturbation ratio determining the noise's standard deviation as a fraction of logit magnitude.
+    """
+
     def __init__(self, model, pert_ratio):
-        super(ModifiedModel, self).__init__()
+        super(PerturbModel, self).__init__()
         self.model = model
         self.pert_ratio = pert_ratio
 
     def forward(self, x):
-        outputs = self.model(x)
-        # Apply perturbation: randomly zero out some correct predictions
-        batch_size = outputs.size(0)
-        pert_mask = torch.rand(batch_size) < self.pert_ratio
-        max_indices = outputs.argmax(dim=1)
-        perturbed_outputs = outputs.clone()
+        """
+        Forward pass with added Gaussian noise to the logits.
 
-        for i in range(batch_size):
-            if pert_mask[i] == 0:
-                perturbed_outputs[i, max_indices[i]] = float('-inf')
+        Args:
+            x (torch.Tensor): Input tensor.
 
-        return perturbed_outputs
+        Returns:
+            torch.Tensor: Perturbed logits.
+        """
+        logits = self.model(x)
+
+        # Scale noise relative to logit magnitudes to ensure consistent perturbation
+        logit_mean = logits.abs().mean()
+
+        # 1  use *20 on cifar10 and *10  on cifar100
+        # noise_std = self.pert_ratio * 10
+
+        # 2 use *10 on cifar10 and *5 on cifar100
+        noise_std = logit_mean * self.pert_ratio * 5
+
+        noise = torch.normal(mean=0.0, std=noise_std, size=logits.size()).to(x.device)
+
+        # Add noise to logits
+        logits_noisy = logits + noise
+
+        return logits_noisy
 
 if __name__ == '__main__':
-    # Load the CIFAR100 test dataset
+    # Load CIFAR-100 test dataset
     transform = torchvision.transforms.Compose([
         torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize(mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761]),
+        torchvision.transforms.Normalize(
+            mean=[0.5071, 0.4867, 0.4408],
+            std=[0.2675, 0.2565, 0.2761],
+        ),
     ])
-    data_test = torchvision.datasets.CIFAR100('dataset', train=False, download=True, transform=transform)
-    dataloader = DataLoader(data_test, batch_size=64)
+    test_dataset = torchvision.datasets.CIFAR100(
+        root='dataset', train=False, download=True, transform=transform
+    )
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-    # Define and load the  model for CIFAR100
+    # Load CIFAR-10 test dataset
+    # transform = torchvision.transforms.Compose([
+    #     torchvision.transforms.ToTensor(),
+    #     torchvision.transforms.Normalize(
+    #         mean=[0.4914, 0.4822, 0.4465],
+    #         std=[0.2023, 0.1994, 0.2010],
+    #     ),
+    # ])
+    # test_dataset = torchvision.datasets.CIFAR10(
+    #     root='dataset', train=False, download=True, transform=transform
+    # )
+    # test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+    # Define and load the model
     model = load_model
-    print("Model successfully loaded:", model)
+    print("Model successfully loaded.")
 
-    # Check the accuracy of the original pretrained model
+    # Evaluate the original pre-trained model
     print("Original Model:")
-    check_accuracy(model, dataloader, device)
+    original_accuracy = check_accuracy(model, test_loader, device)
 
-    # Record
-    writer = SummaryWriter('pert_logs')
-    # Modify the pretrained model based on pert_ratio
-    for i in range(101):
-        un_pert_ratio = round(1 - 0.01 * i, 3)
-        print(f"The current pert_ratio: {un_pert_ratio}")
-        modified_model = ModifiedModel(model, un_pert_ratio)
+    # Initialize TensorBoard writer
+    writer = SummaryWriter('gaussian_noise_outputs_logs')
 
-        # Check the accuracy of the modified pretrained model
-        print("Modified Model:")
-        pert_accuracy = check_accuracy(modified_model, dataloader, device)
-        writer.add_scalar(load_model_name, pert_accuracy, i)
-        print(" ")
+    # Define a list of perturbation ratios (standard deviations as fractions of logit magnitudes)
+    # Smaller step sizes for smoother degradation
+    pert_ratio_list = [round(0.05 * i, 2) for i in range(21)]  # 0.05, 0.10, ..., 1.00
+
+    for idx, pert_ratio in enumerate(pert_ratio_list):
+        print(f"Perturbation ratio: {pert_ratio}")
+
+        perturb_model = PerturbModel(
+            model=model,
+            pert_ratio=pert_ratio
+        ).to(device)
+
+        # Evaluate the modified model; gradients are not required
+        print("Perturbed Model:")
+        pert_accuracy = check_accuracy(perturb_model, test_loader, device)
+        writer.add_scalar('resnet56_cifar100_2', pert_accuracy, idx)
+        relative_ratio = pert_accuracy / original_accuracy if original_accuracy > 0 else 0.0
+        print(f"Relative Accuracy Ratio: {relative_ratio:.4f}\n")
 
     writer.close()
